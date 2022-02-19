@@ -127,7 +127,7 @@
 // 2. Refactor the setup and main loop functions to make them as simple as possible.
 
 #define Program_Name "GPSDO"
-#define Program_Version "v0.06e"
+#define Program_Version "v0.07j"
 #define Author_Name "André Balsa"
 
 // Debug options
@@ -278,15 +278,28 @@ uint32_t regs[6];
 #ifdef OCXO_NDK_ENE3311B
 const uint16_t default_PWM_output = 35585; // "ideal" 16-bit PWM value, varies with OCXO, RC network, and time and temperature
                                            // 35585 for NDK ENE3311B
+const uint16_t ocxo_PWM_correction = 100; // non linear correction for calibration
+  #ifdef FastBootMode
+    const uint16_t ocxo_warmup_time = 15;        // ocxo warmup time in seconds; 15s for testing
+  #else             
+    const uint16_t ocxo_warmup_time = 300;       // ocxo warmup time in seconds;  300s or 600s normal use
+  #endif  // FastBootMode
 #endif // NDK ENE3311B
+
 #ifdef OCXO_CTI_OSC5A2B02
-const uint16_t default_PWM_output = 43600; // "ideal" 16-bit PWM value, varies with OCXO, RC network, and time and temperature
+const uint16_t default_PWM_output = 42300; // "ideal" 16-bit PWM value, varies with OCXO, RC network, and time and temperature
                                            // 43500 for CTI OSC5A2B02
+const uint16_t ocxo_PWM_correction = 100;  // non linear correction for calibration
+  #ifdef FastBootMode
+    const uint16_t ocxo_warmup_time = 15;        // ocxo warmup time in seconds; 15s for testing
+  #else             
+    const uint16_t ocxo_warmup_time = 360;       // ocxo warmup time in seconds; as per spec. abt. 5min
+  #endif  // FastBootMode
 #endif // CTI OSC5A2B02
 										   
 uint16_t adjusted_PWM_output;              // we adjust this value to "close the loop" of the DFLL when using the PWM
 volatile bool must_adjust_DAC = false;     // true when there is enough data to adjust Vctl
-char trendstr[5] = " ___";                 // PWM trend string, set in the adjustVctlPWM() function
+char trendstr[5] = " def";                 // PWM trend string, set in the adjustVctlPWM() function,@start we have def=default, see default_PWM_output
 
 #define VctlInputPin PB0              // ADC pin to read Vctl from DAC
 
@@ -360,7 +373,6 @@ char uptimestr[9] = "00:00:00";    // uptime string
 char updaysstr[5] = "000d";        // updays string
 
 // OCXO frequency measurement
-
 // special 10s sampling rate data structures (work in progress)
 volatile uint16_t esamplingfactor = 10; // sample 64-bit counter every 10 seconds
 volatile uint16_t esamplingcounter = 0; // counter from 0 to esamplingfactor
@@ -413,15 +425,9 @@ volatile bool force_armpicDIV_flag = true;     // indicates picDIV must be armed
 #endif // PICDIV
 
 volatile bool force_calibration_flag = true;   // indicates GPSDO should start calibration sequence
-
 volatile bool ocxo_needs_warming = true;       // indicates OCXO needs to warm up a few minutes after power on
-#ifdef FastBootMode
-  const uint16_t ocxo_warmup_time = 15;        // ocxo warmup time in seconds; 15s for testing
-#else             
-  const uint16_t ocxo_warmup_time = 300;       // ocxo warmup time in seconds;  300s or 600s normal use
-#endif  // FastBootMode
-
 volatile bool tunnel_mode_flag = false;        // the GPSDO relays the information directly to and from the GPS module to the USB serial
+
 #ifdef TunnelModeTesting
 const uint16_t tunnelSecs = 15;                // tunnel mode timeout in seconds; 15s for testing, 300s or 600s normal use
 #else
@@ -926,35 +932,37 @@ boolean getUBX_ACK(uint8_t *MSG) {
 void tunnelgps()
 // GPSDO tunnel mode operation
 {
-  #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
-  Serial2.println();          // Bluetooth serial xor USB serial
-  Serial2.print(F("Entering tunnel mode..."));
-  Serial2.println();
-  #else
-  Serial.println();
-  Serial.print(F("Entering tunnel mode..."));
-  Serial.println();
-  #endif // BLUETOOTH
-
-  // tunnel mode operation goes here
-  uint32_t endtunnelmS = millis() + (tunnelSecs * 1000);
-  uint8_t GPSchar;
-  uint8_t PCchar;
-  while (millis() < endtunnelmS)
-  {
-    if (Serial1.available() > 0)
-    {
-      GPSchar = Serial1.read();
-      Serial.write(GPSchar);  // echo NMEA stream to USB serial
-    }
-    if (Serial.available() > 0)
-    {
-      PCchar = Serial.read();
-      Serial1.write(PCchar);  // echo PC stream to GPS serial
-    }
-  }
-  // tunnel mode operation ends here
+  if(tunnel_mode_flag)
+  {  
+    #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
+    // GPSDO tunnel mode operation  #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
+    Serial2.println();          // Bluetooth serial xor USB serial
+    Serial2.print(F("Entering tunnel mode..."));
+    Serial2.println();
+    #else
+    Serial.println();
+    Serial.print(F("Entering tunnel mode..."));
+    Serial.println();
+    #endif // BLUETOOTH
   
+    // tunnel mode operation goes here
+    uint32_t endtunnelmS = millis() + (tunnelSecs * 1000);
+    uint8_t GPSchar;
+    uint8_t PCchar;
+    while (millis() < endtunnelmS)
+    {
+      if (Serial1.available() > 0)
+      {
+        GPSchar = Serial1.read();
+        Serial.write(GPSchar);  // echo NMEA stream to USB serial
+      }
+      if (Serial.available() > 0)
+      {
+        PCchar = Serial.read();
+        Serial1.write(PCchar);  // echo PC stream to GPS serial
+      }
+    }
+  // tunnel mode operation ends here
   #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
   Serial2.println();          // Bluetooth serial xor USB serial
   Serial2.print(F("Tunnel mode exited."));
@@ -966,18 +974,20 @@ void tunnelgps()
   #endif // BLUETOOTH
   
   tunnel_mode_flag = false; // reset flag, exit tunnel mode
-}
-void docalibration()
-// OCXO Vctl calibration routine: find an approximate value for Vctl
+  }   //end if(tunnel_mode_flag)
+} //end tunnelgps()
+
+void dowarming()
 {
-  unsigned long startWarmup = millis(); // we need a rough timer
-  if (ocxo_needs_warming) {
+   // GPSDO calibration routine  
+//  if (ocxo_needs_warming)
+//  {
     // spend a few seconds/minutes here waiting for the OCXO to warm
     // show countdown timer on OLED display
     // and report on either USB serial or Bluetooth serial
     // Note: during calibration the GPSDO does not accept any commands
-    uint16_t countdown = ocxo_warmup_time;
-	// put som content into the displays
+    uint16_t warmup_countdown = ocxo_warmup_time;   
+    Serial.print(F("Warming up "));
     #ifdef GPSDO_OLED
     disp.clear();                // display warmup message on OLED
     disp.setCursor(0, 0);
@@ -1006,197 +1016,224 @@ void docalibration()
     disp.setCursor(0, 24);
     disp.print(F("OCXO warming up"));
     disp.setCursor(0, 32);
-    disp.print(F("Please wait"));
+    disp.print(F("Please wait for .... "));
+    disp.print(ocxo_warmup_time);
+    disp.print(F("s"));
     #endif // LCD_ST7735
 
-    while (countdown) {
-          yellow_led_state = 2;        // blink yellow LED
-    
-          #ifdef GPSDO_OLED
-          disp.setCursor(5, 4);
-          disp.print(countdown);
-          disp.print(F("s     "));
-          #endif // OLED
-          
-          #ifdef GPSDO_LCD_ST7735
-          disp.setCursor(0, 40);
-          disp.print(countdown);
-          disp.print(F("s     "));
-          #endif // LCD_ST7735
-          
-          #ifdef GPSDO_BLUETOOTH      // print warming up message to either
-          Serial2.println();          // Bluetooth serial xor USB serial
-          Serial2.print(F("Warming up "));
-          Serial2.print(countdown);
-          Serial2.println(F("s"));
-          #else
-          Serial.println();
-          Serial.print(F("Warming up "));
-          Serial.print(countdown);
-          Serial.println(F("s"));
-          #endif // BLUETOOTH
+    while (warmup_countdown)
+    {
+      warmup_countdown--;
+      yellow_led_state = 2;        // blink yellow LED
 
-          // do nothing for 1s
-          delay(1000);
-          countdown--;
+      #ifdef GPSDO_OLED
+      disp.setCursor(5, 4);
+      disp.print(warmup_countdown);
+      disp.print(F("s     "));
+      #endif // OLED
+      
+      #ifdef GPSDO_LCD_ST7735
+      disp.setCursor(0, 40);
+      disp.print(warmup_countdown);
+      disp.print(F("s     "));
+      #endif // LCD_ST7735
+      
+      #ifdef GPSDO_BLUETOOTH      // print warming up message to either
+      Serial2.println();          // Bluetooth serial xor USB serial
+      Serial2.print(F("Warming up "));
+      Serial2.print(warmup_countdown);
+      Serial2.println(F("s"));
+      #else
+      Serial.println();
+      Serial.print(F("Warming up "));
+      Serial.print(warmup_countdown);
+      Serial.println(F("s"));
+      #endif // BLUETOOTH
+
+      // do nothing for 1s
+      delay(1000);          
     }
-    ocxo_needs_warming = false; // reset flag, next "hot" calibration skips ocxo warmup 
-  }
-  // proceed with calibration
-  #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
-  Serial2.println();          // Bluetooth serial xor USB serial
-  Serial2.print(F("Calibrating..."));
-  Serial2.println();
-  #else
-  Serial.println();
-  Serial.print(F("Calibrating..."));
-  Serial.println();
-  #endif // BLUETOOTH
+    Serial.println(F("")); 
+    Serial.print(F("Warming done."));
+    Serial.println(F("")); 
+    
+	  ocxo_needs_warming = false; // reset flag, next "hot" calibration skips ocxo warmup 
 
-  #ifdef GPSDO_OLED
-  disp.clear();                // display calibrating message on OLED
-  disp.setCursor(0, 0);
-  disp.print(F(Program_Name));
-  disp.print(F(" - "));
-  disp.print(F(Program_Version));
-  disp.setCursor(0, 2);
-  disp.print(F("Calibrating..."));
-  disp.setCursor(0, 3);
-  disp.print(F("Please wait"));
-  #endif // OLED
+    delay(3000);    
+ // } //end if (ocxo_needs_warming)
+	  
+} //end dowarming()
 
-  #ifdef GPSDO_LCD_ST7735
-  disp.fillRect(0, 19, 160, 108, ST7735_BLACK);   // clear display if command is used
-  disp.setCursor(0, 32);
-  disp.print(F("Warm up...done"));
-  disp.setCursor(0, 40);
-  disp.print(F("Calibrating...      "));    // spaces needed to overwrite previous
-  disp.setCursor(0, 48);
-  disp.print(F("Please wait"));
-  #endif // LCD_ST7735
 
-  /*  The calibration algorithm
-   *  The objective of the calibration is to find the approximate Vctl to obtain
-   *  10MHz +/- 0.1Hz.
-   *  
-   *  we can use either a PID algorithm or a simple linear interpolation algorithm
-   *  
-   *  The following describes a simple linear interpolation algorithm
-   *  
-   *  We first output 1.5V for the DAC or PWM, wait 30 seconds and note the 10s frequency average.
-   *  Next we output 2.5V for the DAC or PWM, wait 30 seconds and note the 10s frequency average.
-   *  Now we calculate the Vctl for 10MHz +/- 0.1Hz using linear interpolation between the two points.
-   */
-  // for 12-bit DAC
-  // 1.5V for DAC = 4096 x (1.5 / 3.3) = 1862 results in frequency f1 = 10MHz + e1
-  // 2.5V for DAC = 4096 x (2.5 / 3.3) = 3103 results in frequency f2 = 10MHz + e2
-  // for 16-bit PWM
-  // 1.5V for PWM = 65536 x (1.5 / 3.2) = 30720 results in frequency f1 = 10MHz + e1
-  // 2.5V for PWM = 65536 x (2.5 / 3.2) = 51200 results in frequency f2 = 10MHz + e2
-  // where f2 > f1 (most OCXOs have positive slope).
-  double f1, f2, e1, e2;
-  // make sure we have a fix and data
-  while (!cbTen_full) delay(1000);
-  // measure frequency for Vctl=1.5V
-  Serial.println(F("set PWM 1.5V, wait 15s"));
-  //
-  #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735 
-  #ifdef GPSDO_OLED        
-  disp.setCursor(0, 3);    
-  disp.clearLine(3);       
-  #endif // OLED           
-  #ifdef GPSDO_LCD_ST7735         
-  disp.setCursor(0, 56);   
-  #endif // LCD            
-  disp.print(F("Vctl: 1.5V / 15s"));
-  #endif // OLED | LCD     
-  //                         
-  analogWrite(VctlPWMOutputPin, 30720);
-  delay(15000);
-  f1 = avgften;
-  //
-  Serial.print(F("f1 (average frequency for 1.5V Vctl): "));
-  Serial.print(f1,1);
-  Serial.println(F(" Hz"));
-  //
-  #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735 
-  #ifdef GPSDO_OLED        
-  disp.setCursor(0, 4);    
-  disp.clearLine(4);       
-  disp.setCursor(0, 5);    
-  disp.clearLine(5);       
-  #endif // OLED           
-  #ifdef GPSDO_LCD_ST7735         
-  disp.setCursor(0, 64);   
-  #endif // LCD            
-  disp.print(F("F1:"));    
-  disp.print(f1,1);        
-  disp.print(F(" Hz"));    
-  disp.setCursor(0, 80);   
-  #endif // OLED | LCD     
-  disp.print(F("Vctl: 2.5V / 15s"));
-  //                         
-  // make sure we have a fix and data again
-  while (!cbTen_full) delay(1000);
-  // measure frequency for Vctl=2.5V
-  Serial.println(F("set PWM 2.5V, wait 15s"));
-  analogWrite(VctlPWMOutputPin, 51200);
-  delay(15000);
-  f2 = avgften;
-  //
-  Serial.print(F("f2 (average frequency for 2.5V Vctl): "));
-  Serial.print(f2,1);
-  Serial.println(F(" Hz"));
-  //
-  // slope s is (f2-f1) / (51200-30720) for PWM
-  // So F=10MHz +/- 0.1Hz for PWM = 30720 - (e1 / s)
-  // set Vctl
-  // adjusted_PWM_output = formula
-  adjusted_PWM_output = 30720 - ((f1 - 10000000.0) / ((f2 - f1) / 20480));
-  analogWrite(VctlPWMOutputPin, adjusted_PWM_output); 
-  //
-  // calibration done, perform some outputs to serial and display
-  //
-  Serial.print(F("Calculated PWM: "));
-  Serial.println(adjusted_PWM_output);
-  //
-  #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735  
-  #ifdef GPSDO_OLED        
-  disp.setCursor(0, 6);    
-  disp.clearLine(6);       
-  #endif // OLED           
-  #ifdef GPSDO_LCD_ST7735         
-  disp.setCursor(0, 88);   
-  #endif // LCD            
-  disp.print(F("F2:"));    
-  disp.print(f2,1);        
-  disp.println(F(" Hz"));   
-  disp.println(F(" "));   
-  disp.print(F("...Calibration done."));
+void docalibration()
+// OCXO Vctl calibration routine: find an approximate value for Vctl
+{
+     // proceed with calibration
+     #ifdef GPSDO_BLUETOOTH      // print calibrating started message to either
+     Serial2.println();          // Bluetooth serial xor USB serial
+     Serial2.print(F("Calibrating..."));
+     Serial2.println();
+     #else
+     Serial.println();
+     Serial.print(F("Calibrating..."));
+     Serial.println();
+     #endif // BLUETOOTH
+     
+     #ifdef GPSDO_OLED
+     disp.clear();                // display calibrating message on OLED
+     disp.setCursor(0, 0);
+     disp.print(F(Program_Name));
+     disp.print(F(" - "));
+     disp.print(F(Program_Version));
+     disp.setCursor(0, 2);
+     disp.print(F("Calibrating..."));
+     disp.setCursor(0, 3);
+     disp.print(F("Please wait"));
+     #endif // OLED
+     
+     #ifdef GPSDO_LCD_ST7735
+     disp.fillRect(0, 19, 160, 108, ST7735_BLACK);   // clear display if command is used
+     disp.setCursor(0, 24);
+     disp.print(F("Warm up...done        "));
+     disp.setCursor(0, 32);
+     disp.print(F("GPS fix...ok          "));    // spaces needed to overwrite previous
+     disp.setCursor(0, 40);
+     disp.print(F("Calibrating...        "));    // spaces needed to overwrite previous
+     disp.setCursor(0, 48);
+     disp.print(F("Please wait           "));
+     #endif // LCD_ST7735
+     
+     /*  The calibration algorithm
+      *  The objective of the calibration is to find the approximate Vctl to obtain
+      *  10MHz +/- 0.001Hz.
+      *  
+      *  we can use either a PID algorithm or a simple linear interpolation algorithm
+      *  
+      *  The following describes a simple linear interpolation algorithm
+      *  
+      *  We first output 1.5V for the DAC or PWM, wait 30 seconds and note the 10s frequency average.
+      *  Next we output 2.5V for the DAC or PWM, wait 30 seconds and note the 10s frequency average.
+      *  Now we calculate the Vctl for 10MHz +/- 0.1Hz using linear interpolation between the two points.
+      */
+     // for 12-bit DAC
+     // 1.5V for DAC = 4096 x (1.5 / 3.3) = 1862 results in frequency f1 = 10MHz + e1
+     // 2.5V for DAC = 4096 x (2.5 / 3.3) = 3103 results in frequency f2 = 10MHz + e2
+	   //
+     // for 16-bit PWM
+     // 1.5V for PWM = 65536 x (1.5 / 3.2) = 30720 results in frequency f1 = 10MHz + e1
+     // 2.5V for PWM = 65536 x (2.5 / 3.2) = 51200 results in frequency f2 = 10MHz + e2
+     // where f2 > f1 (most OCXOs have positive slope).
+     double f1, f2, e1, e2;
+     // make sure we have a fix and data
+     //while (!cbTen_full) delay(1000);   // moved into fix loop
+     // measure frequency for Vctl=1.5V
+     Serial.println(F("set PWM 1.5V, wait 15s"));
+     //
+     #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735 
+     #ifdef GPSDO_OLED        
+     disp.setCursor(0, 3);    
+     disp.clearLine(3);       
+     #endif // OLED           
+     #ifdef GPSDO_LCD_ST7735         
+     disp.setCursor(0, 56);   
+     #endif // LCD            
+     disp.print(F("Vctl: 1.5V / 15s"));
+     #endif // OLED | LCD     
+     //
+     // 1.5V  
+     analogWrite(VctlPWMOutputPin, 30720);
+     delay(15000);
+     // we expect something like 9999998.6Hz
+     f1 = avgften;
+     //
+     Serial.print(F("f1 (average frequency for 1.5V Vctl): "));
+     Serial.print(f1,1);
+     Serial.println(F(" Hz"));
+     //
+     #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735 
+     #ifdef GPSDO_OLED        
+     disp.setCursor(0, 4);    
+     disp.clearLine(4);       
+     disp.setCursor(0, 5);    
+     disp.clearLine(5);       
+     #endif // OLED           
+     #ifdef GPSDO_LCD_ST7735         
+     disp.setCursor(0, 64);   
+     #endif // LCD            
+     disp.print(F("F1:"));    
+     disp.print(f1,1);        
+     disp.print(F(" Hz"));    
+     disp.setCursor(0, 80);   
+     #endif // OLED | LCD     
+     disp.print(F("Vctl: 2.5V / 15s"));
+     //                         
+     // make sure we have a fix and data again
+     //while (!cbTen_full) delay(1000);
+     // measure frequency for Vctl=2.5V
+     Serial.println(F("set PWM 2.5V, wait 15s"));
+     // 2.5V
+     analogWrite(VctlPWMOutputPin, 51200);
+     delay(15000);
+     // we expect something like 10000003.6Hz
+     f2 = avgften;
+     //
+     Serial.print(F("f2 (average frequency for 2.5V Vctl): "));
+     Serial.print(f2,1);
+     Serial.println(F(" Hz"));
+     //
+     // slope s is (f2-f1) / (51200-30720) for PWM
+     // So F=10MHz +/- 0.1Hz for PWM = 30720 - (e1 / s)
+	   // we assume that the ctrl voltage is nearly linear, to ease calculation
+     // set Vctl
+     // adjusted_PWM_output = formula
+     //adjusted_PWM_output = 30720 - ((f1 - 10000000.0) / ((f2 - f1) / 20480));
+     adjusted_PWM_output = 30720 + ((10000000 -f1) / ((f2 - f1) / 20480)) - ocxo_PWM_correction;
+     analogWrite(VctlPWMOutputPin, adjusted_PWM_output); 
+     //
+     // calibration done, perform some outputs to serial and display
+     //
+     Serial.print(F("Calculated PWM: "));
+     Serial.println(adjusted_PWM_output);
+     //
+     #if defined GPSDO_OLED || defined GPSDO_LCD_ST7735  
+     #ifdef GPSDO_OLED        
+     disp.setCursor(0, 6);    
+     disp.clearLine(6);       
+     #endif // OLED           
+     #ifdef GPSDO_LCD_ST7735         
+     disp.setCursor(0, 88);   
+     #endif // LCD            
+     disp.print(F("F2:"));    
+     disp.print(f2,1);        
+     disp.println(F(" Hz"));   
+     disp.println(F(" "));   
+     disp.print(F("...Calibration done."));
+     
+     #endif // OLED | LCD     
+     
+     #ifdef GPSDO_BLUETOOTH      // print calibration finished message to either
+     Serial2.println();          // Bluetooth serial xor USB serial
+     Serial2.print(F("Calibration done."));
+     Serial2.println();
+     #else
+     Serial.println();
+     Serial.print(F("Calibration done."));
+     Serial.println();
+     #endif // BLUETOOTH
+     
+     delay(3000);      // see values on display for this time
+     
+     #ifdef GPSDO_OLED
+     disp.clear();  
+     #endif // OLED
+      
+     #ifdef GPSDO_LCD_ST7735
+     disp.fillScreen(ST7735_BLACK);  
+     #endif // LCD_ST7735 
+     
+     force_calibration_flag = false; // reset flag, calibration done
+     strcpy(trendstr, " cal");
   
-  #endif // OLED | LCD     
-  
-  #ifdef GPSDO_BLUETOOTH      // print calibration finished message to either
-  Serial2.println();          // Bluetooth serial xor USB serial
-  Serial2.print(F("Calibration done."));
-  Serial2.println();
-  #else
-  Serial.println();
-  Serial.print(F("Calibration done."));
-  Serial.println();
-  #endif // BLUETOOTH
-
-  delay(3000);      // see values on display for this time
-
-  #ifdef GPSDO_OLED
-  disp.clear();  
-  #endif // OLED
-   
-  #ifdef GPSDO_LCD_ST7735
-  disp.fillScreen(ST7735_BLACK);  
-  #endif // LCD_ST7735 
-  
-  force_calibration_flag = false; // reset flag, calibration done
 } // end of docalibration()
 
 #ifdef GPSDO_MCP4725
@@ -1273,12 +1310,12 @@ void adjustVctlPWM()
   else if (avgfhun >= 10000000.01) {
     if (avgfhun >= 10000000.10) {
       // decrease PWM by 100 bits = coarse
-      adjusted_PWM_output = adjusted_PWM_output - 100;
+      adjusted_PWM_output = adjusted_PWM_output - 200;
     strcpy(trendstr, " c- ");
       }
     else {
       // decrease PWM by ten bits = fine
-      adjusted_PWM_output = adjusted_PWM_output - 10;
+      adjusted_PWM_output = adjusted_PWM_output - 20;
     strcpy(trendstr, " f- ");
       }
   }
@@ -1286,12 +1323,12 @@ void adjustVctlPWM()
   else if (avgfhun <= 9999999.99) {
     if (avgfhun <= 9999999.90) {
      // increase PWM by 100 bits = coarse
-      adjusted_PWM_output = adjusted_PWM_output + 100;     
+      adjusted_PWM_output = adjusted_PWM_output + 200;     
     strcpy(trendstr, " c+ ");
     }
   else {
     // increase PWM by ten bits = fine
-      adjusted_PWM_output = adjusted_PWM_output + 10;
+      adjusted_PWM_output = adjusted_PWM_output + 20;
       strcpy(trendstr, " f+ ");
     }
   }
@@ -1342,7 +1379,9 @@ bool gpsWaitFix(uint16_t waitSecs)
       #endif // VERBOSE_NMEA
     }
 
-    if (gps.location.isUpdated() && gps.altitude.isUpdated() && gps.date.isUpdated())
+ //   if (gps.location.isUpdated() && gps.altitude.isUpdated() && gps.date.isUpdated())
+   // if (gps.location.isUpdated() && gps.altitude.isUpdated() && gps.date.isUpdated() && gps.satellites.value() > 3)
+    if (gps.location.isValid() && gps.location.age() < 2000 && gps.satellites.value() > 3)
     {
       endFixmS = millis();                                //record the time when we got a GPS fix
       return true;
@@ -1422,8 +1461,10 @@ void printGPSDOstats(Stream &Serialx)
   Serialx.print("VctlPWM: ");
   Serialx.print(Vctlp);
   Serialx.print("  PWM: ");
-  Serialx.println(adjusted_PWM_output);
-
+  Serialx.print(adjusted_PWM_output);
+  Serialx.print(" ");
+  Serialx.println(trendstr);
+ 
   #ifdef GPSDO_VCC
   // Vcc/2 is provided on pin PA0
   float Vcc = (float(avgVcc)/4096) * 3.3 * 2.0;
@@ -1462,6 +1503,7 @@ void printGPSDOstats(Stream &Serialx)
   // Serialx.println(tim2overflowcounter);
   // Serialx.print(F("Least Significant 32 bits (TIM2->CCR3): "));
   // Serialx.println(lsfcount);
+  
   Serialx.print(F("64-bit Counter: "));
   Serialx.println(fcount64);
   Serialx.print(F("Frequency: "));
@@ -1472,25 +1514,33 @@ void printGPSDOstats(Stream &Serialx)
   Serialx.print(avgften,1);
   Serialx.print(F(" Hz"));
   Serialx.print(F("  count: "));
-  Serialx.println(cbiten_newest);
-    
+  Serialx.print(cbiten_newest);
+  Serialx.print(F("  full: "));
+  Serialx.println(cbTen_full ? "true" : "false");
+ 
   Serialx.print("100s Frequency Avg: ");
   Serialx.print(avgfhun,2);
   Serialx.print(F(" Hz"));
   Serialx.print(F("  count: "));
-  Serialx.println(cbihun_newest);
+  Serialx.print(cbihun_newest);
+  Serialx.print(F("  full: "));
+  Serialx.println(cbHun_full ? "true" : "false");
 
   Serialx.print("1,000s Frequency Avg: ");
   Serialx.print(avgftho,3);
   Serialx.print(F(" Hz"));
   Serialx.print(F("  count: "));
-  Serialx.println(cbitho_newest);
+  Serialx.print(cbitho_newest);
+  Serialx.print(F("  full: "));
+  Serialx.println(cbTho_full ? "true" : "false");
 
   Serialx.print("10,000s Frequency Avg: ");
   Serialx.print(avgftth,4);
   Serialx.print(F(" Hz"));  
   Serialx.print(F("  count: "));
-  Serialx.println(cbitth_newest);
+  Serialx.print(cbitth_newest);
+  Serialx.print(F("  full: "));
+  Serialx.println(cbTth_full ? "true" : "false");
 
   #ifdef GPSDO_BMP280_SPI
   // BMP280 measurements
@@ -2114,6 +2164,8 @@ void setup()
   avgpwmVctl = avg_pwmVctl.reading(pwmVctl);
 
   startGetFixmS = millis();
+  
+  dowarming(); 
 
   // setup done
 }
@@ -2123,12 +2175,14 @@ void loop()
   serial_commands_.ReadSerial();  // process any command from either USB serial (usually 
                                   // the Arduino monitor) xor Bluetooth serial (e.g. a smartphone)
 
-  if (tunnel_mode_flag) tunnelgps(); else
+  //dowarming(); 
+  tunnelgps();
   
   if (gpsWaitFix(waitFixTime))    // wait up to waitFixTime seconds for fix, returns true if we have a fix
   {
     if (force_calibration_flag) docalibration(); // if we have gps fix we can start calibration
-	#ifdef GPSDO_BLUETOOTH
+    
+	  #ifdef GPSDO_BLUETOOTH
     Serial2.println();
     Serial2.println();
     Serial2.print(F("Fix time "));
@@ -2266,10 +2320,5 @@ void loop()
     // no fix, raise flush_ring_buffers_flag
     flush_ring_buffers_flag = true;
     strcpy(trendstr, " nof");
-	// no fix at iniial startup, set PWM to reasonable value
-    if (!force_calibration_flag) {
-       adjusted_PWM_output = default_PWM_output;     
-       analogWrite(VctlPWMOutputPin, adjusted_PWM_output);
-	}
   }
 } // end of loop()
